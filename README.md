@@ -3,7 +3,10 @@
 The TV's firmware caps every TCP connection's receive buffer at 2 MB, so a player's single connection to the TorBox CDN
 is slow. Relay is a small app on the TV (`com.gathin.relay`, port 7000) that sits between Wuplay/Stremio and your
 add-on. Players still open one connection, to the relay; the relay downloads the file over several parallel Range
-connections and hands the bytes over in order. Nothing in Wuplay or Stremio is modified.
+connections and hands the bytes over in order. Each connection streams a long run of the file (32 MB) with one
+request, instead of one request per chunk, because every new request to TorBox costs 1-2.5 s before data flows plus
+TCP slow start. When a run is near its end, the next connection is already opened, which hides that delay. Nothing in
+Wuplay or Stremio is modified.
 
 ```
 Wuplay / Stremio ──1 conn──▶ relay on the TV (127.0.0.1:7000) ──4 conns──▶ resolver ─▶ TorBox CDN
@@ -13,13 +16,15 @@ Wuplay / Stremio ──1 conn──▶ relay on the TV (127.0.0.1:7000) ──4 
 
 | | avg Mbps |
 |---|---|
-| Direct, 1 connection (what the players do) | 15–21 |
-| **Through the relay** (default: 4 conns, 16 MB chunks) | **38–50** |
-| Direct, 4 connections (ceiling) | 54–57 |
+| Direct, 1 connection (what the players do) | 14 |
+| Direct, 4 plain parallel connections | 37 |
+| Old relay (one request per 16 MB chunk), earlier that evening | 38–50 |
+| **Relay now** (4 streaming connections, 32 MB runs) | **51–68** |
 
-That evening one connection to TorBox HARE only got 10–20 Mbps (earlier it was 85–90). The relay gave 2–4× the
-single-connection speed and 70–90 % of the 4-connection ceiling. Wuplay's normal playback through Duck Streams was
-measured at ~98 Mbps on wlan0 when the route was healthy.
+That evening one connection to TorBox HARE only got 10–20 Mbps (earlier it was 85–90). The relay now gives 3.5–5×
+a single connection. Wuplay's normal playback through Duck Streams was measured at ~98 Mbps on wlan0 when the route
+was healthy. The per-second rate through the relay is bursty (it hands over data in file order), which the player's
+own buffer smooths out.
 
 ## What's installed
 
@@ -44,9 +49,9 @@ Open it from a phone or PC on the home Wi-Fi.
   contains your config/key), give it a short id, press Add. Re-adding with the same id replaces the URL. The page then
   lists the two URLs to add in Stremio and Wuplay. URLs with `user:password@` also work.
 - **Remove** one with its Remove button (then remove the ⚡ add-on in the apps too).
-- **Tuning**: parallel connections (default 4), chunk size (16 MB), memory budget (96 MB). 4 × 16 MB was the
-  fastest tested; 6 × 8 MB was equal. With a 4K player running the TV still had ~325 MB free. If the TV gets
-  sluggish, lower the budget to 64 MB. More than 4–6 connections isn't needed and keeps use clearly "normal" for
+- **Tuning**: parallel connections (default 4), request size per connection (32 MB), memory budget (96 MB). With
+  a 4K player running the TV still had ~325 MB free. If the TV gets sluggish, lower the budget to 64 MB. Up to 2
+  extra connections open briefly while runs hand over. More than 4–6 connections isn't needed and keeps use clearly "normal" for
   TorBox (their terms set no per-file connection limit, only fair use; download managers do the same).
 - **Recent streams** shows the CDN host, connections, MB, average speed and retries per stream. A warning
   appears if streams go through MediaFlow/StremThru *proxy* hosts (then only the hop to the proxy is sped up).

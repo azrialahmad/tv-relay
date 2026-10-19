@@ -25,8 +25,8 @@ import java.util.regex.Pattern;
 
 // /play: multi-connection Range relay. The firmware caps each TCP socket's receive buffer at 2 MB, which
 // limits one connection to ~90 Mbps on this TV. The relay answers the player's (Range) request itself and
-// fills it by fetching consecutive chunks of the file over several parallel Range connections, writing them
-// to the player in order. Memory is bounded by a shared pool of chunk buffers.
+// fills it over several parallel Range connections, each streaming a long run of the file (one request per run,
+// not per chunk), writing the bytes to the player in order. Memory is bounded by a shared pool of 4 MB buffers.
 final class Relay {
     static final String TAG = HttpServer.TAG;
 
@@ -34,7 +34,7 @@ final class Relay {
     private final ExecutorService pool;
     private final Map<String, Target> targets = new HashMap<>();
     private BufferPool buffers;
-    private int bufferChunk;
+
 
     // Stats for the status page (hosts only, never URLs).
     static final class Stat {
@@ -279,16 +279,15 @@ final class Relay {
         return s;
     }
 
+    static final int PIECE = 4 << 20; // buffer unit
+
     synchronized BufferPool buffers() {
-        int chunk = store.chunkMb() << 20;
-        if (buffers == null || bufferChunk != chunk) {
-            buffers = new BufferPool(chunk, Math.max(2, (store.budgetMb() << 20) / chunk));
-            bufferChunk = chunk;
-        }
+        int max = Math.max(4, (store.budgetMb() << 20) / PIECE);
+        if (buffers == null || buffers.max != max) buffers = new BufferPool(PIECE, max);
         return buffers;
     }
 
-    // Fixed-size chunk buffers shared by all sessions. Buffers are kept for reuse while streaming and
+    // Fixed-size piece buffers shared by all sessions. Buffers are kept for reuse while streaming and
     // dropped (left to GC) after a minute without use.
     static final class BufferPool {
         final int size, max;
@@ -298,11 +297,12 @@ final class Relay {
 
         BufferPool(int size, int max) { this.size = size; this.max = max; }
 
-        // Blocks while the budget is used up. `must` lets a session with nothing in flight go 1 over budget,
-        // so a stalled reader (paused player) can never starve a new one.
+        // Blocks while the budget is used up, except for the piece the player needs next, so a stalled
+        // reader (paused player) can never starve a new one. A blocked worker keeps its connection open:
+        // TCP flow control pauses the server until a buffer frees up.
         synchronized byte[] take(Session s, int index) throws InterruptedException {
-            while (out >= max && !s.isHead(index) && !s.cancelled) wait(500);
-            if (s.cancelled) return null;
+            while (out >= max && !s.isHead(index) && !s.cancelled && !s.isAborted(index)) wait(500);
+            if (s.cancelled || s.isAborted(index)) return null;
             out++;
             lastUse = System.currentTimeMillis();
             byte[] b = free.poll();
@@ -317,6 +317,8 @@ final class Relay {
             notifyAll();
         }
 
+        synchronized void wake() { notifyAll(); }
+
         synchronized void trim() {
             if (out == 0 && System.currentTimeMillis() - lastUse > 60_000) { allocated -= free.size(); free.clear(); }
         }
@@ -324,60 +326,70 @@ final class Relay {
         synchronized String describe() { return out + " in use, " + free.size() + " idle, " + (size >> 20) + " MB each, budget " + max; }
     }
 
-    // One Range request's worth of a chunk. Idle workers split the slowest unfinished segment in two, so one
-    // stalled connection never holds up the chunk the player needs next.
-    private static final class Seg {
-        int filled, to; // offsets inside the chunk: bytes [start, filled) are in, the segment ends at `to`
-        boolean working;
-        HttpURLConnection conn;
-        long progress; // time of the last bytes received
-        Seg(int from, int to) { this.filled = from; this.to = to; }
-    }
-
-    private static final class Chunk {
+    private static final class Piece {
         final int index;
         final long begin;
         final int len;
         byte[] buf;
-        final List<Seg> segs = new ArrayList<>(); // in file order
-        int workers;
-        boolean aborted;
+        int filled;
+        boolean reading, aborted; // reading: a worker owns the buffer right now
+        HttpURLConnection conn;   // set while bytes for this piece are arriving
+        long progress;            // time of the last bytes received
         IOException err;
-        Chunk(int index, long begin, int len) { this.index = index; this.begin = begin; this.len = len; }
+        Piece(int index, long begin, int len) { this.index = index; this.begin = begin; this.len = len; }
     }
 
-    static final int MIN_SPLIT = 1 << 20; // don't split segments with less than this left
+    // Consecutive pieces [cur, endIdx) fetched by ONE Range request that streams straight through them, so a
+    // connection pays its request latency and TCP slow start once per run, not once per piece. An idle worker
+    // may take over the unstarted second half of a run (endIdx shrinks; the owner stops there).
+    private static final class Run {
+        int cur, endIdx;
+        boolean streaming = true; // counts toward `conns` until it is near its end
+        Run(int cur, int endIdx) { this.cur = cur; this.endIdx = endIdx; }
+    }
+
+    static final int TAIL = 6 << 20; // a run this close to its end lets another connection start (hides its TTFB)
 
     final class Session {
         final Target t;
         final long start, end;
-        final int chunk, conns, count;
+        final int piece, conns, count, runPieces;
         final BufferPool bp;
-        final Map<Integer, Chunk> chunks = new HashMap<>();
-        int next, writeIdx;
+        final Map<Integer, Piece> pieces = new HashMap<>();
+        final List<Run> runs = new ArrayList<>();
+        int next, writeIdx, streaming;
         volatile boolean cancelled, superseded;
         final Stat st;
 
         Session(Target t, long start, long end) {
             this.t = t; this.start = start; this.end = end;
             bp = buffers();
-            chunk = bp.size;
+            piece = bp.size;
             conns = store.conns();
-            count = (int) ((end - start + chunk) / chunk);
+            runPieces = Math.max(1, (store.runMb() << 20) / piece);
+            count = (int) ((end - start + piece) / piece);
             st = stat(t, conns);
             st.from = start; st.to = end;
         }
 
         synchronized boolean isHead(int index) { return index == writeIdx; }
 
-        private int ahead() { return superseded ? 1 : Math.max(2, Math.min(conns + 2, bp.max - 1)); }
+        synchronized boolean isAborted(int index) {
+            Piece p = pieces.get(index);
+            return p == null || p.aborted;
+        }
+
+        // How far past the player's position new runs may start.
+        private int window() { return superseded ? 1 : bp.max; }
 
         boolean run(HttpServer.Req r) throws IOException {
             OutputStream out = r.out;
-            for (int i = 0; i < Math.min(conns, count); i++) { final int id = i; pool.execute(() -> work(id)); }
+            // A couple of spare workers take over when a run nears its end.
+            int workers = Math.min(conns + 2, count);
+            for (int i = 0; i < workers; i++) { final int id = i; pool.execute(() -> work(id)); }
             try {
                 for (int k = 0; k < count; k++) {
-                    Chunk c;
+                    Piece c;
                     int written = 0;
                     while (true) {
                         int upto;
@@ -385,14 +397,14 @@ final class Relay {
                             long waited = 0;
                             while (true) {
                                 if (cancelled) throw new IOException("cancelled");
-                                c = chunks.get(k);
+                                c = pieces.get(k);
                                 if (c != null && c.err != null) throw c.err;
-                                if (c != null && c.buf != null && (upto = readable(c, written)) > written) break;
+                                if (c != null && c.buf != null && (upto = c.filled) > written) break;
                                 try { wait(250); } catch (InterruptedException e) { throw new IOException(e); }
                                 waited += 250;
                                 // Nothing to write for a while: check whether the player hung up.
                                 if (waited % 1000 == 0 && clientGone(r)) throw new IOException("client gone");
-                                kickStalled(c, written);
+                                kickStalled(c);
                             }
                         }
                         out.write(c.buf, written, upto - written);
@@ -403,7 +415,7 @@ final class Relay {
                     }
                     byte[] release;
                     synchronized (this) {
-                        chunks.remove(k);
+                        pieces.remove(k);
                         release = c.buf;
                         c.buf = null;
                         writeIdx = k + 1;
@@ -423,34 +435,16 @@ final class Relay {
             }
         }
 
-        // End of the contiguous filled run starting at `pos` (segments are in order and adjacent).
-        private int readable(Chunk c, int pos) {
-            for (Seg s : c.segs) {
-                if (pos < s.to) return pos >= segStart(c, s) ? Math.max(pos, s.filled) : pos;
-            }
-            return pos;
-        }
-
-        private int segStart(Chunk c, Seg s) {
-            int i = c.segs.indexOf(s);
-            return i == 0 ? 0 : c.segs.get(i - 1).to;
-        }
-
-
-        // The player is waiting on this segment: if its connection has gone quiet, drop it so the worker retries
+        // The player is waiting on this piece: if its connection has gone quiet, drop it so the worker retries
         // on a fresh one at once instead of waiting for the read timeout.
-        private void kickStalled(Chunk c, int pos) {
-            if (c == null) return;
+        private void kickStalled(Piece c) {
+            if (c == null || c.conn == null || c.filled >= c.len) return;
             long now = System.currentTimeMillis();
-            for (Seg s : c.segs) {
-                if (pos >= s.to) continue;
-                if (s.working && s.conn != null && s.filled < s.to && now - s.progress > 1500) {
-                    HttpURLConnection h = s.conn;
-                    s.progress = now;
-                    st.retries++;
-                    pool.execute(h::disconnect);
-                }
-                return;
+            if (now - c.progress > 2500) {
+                HttpURLConnection h = c.conn;
+                c.progress = now;
+                st.retries++;
+                pool.execute(h::disconnect);
             }
         }
 
@@ -474,149 +468,117 @@ final class Relay {
         }
 
         // Another request for the same file arrived (a seek): stop reading ahead here and free the bandwidth.
-        void supersede() {
-            List<HttpURLConnection> drop = new ArrayList<>();
-            List<byte[]> release = new ArrayList<>();
-            synchronized (this) {
-                superseded = true;
-                for (Iterator<Chunk> it = chunks.values().iterator(); it.hasNext(); ) {
-                    Chunk c = it.next();
-                    if (c.index <= writeIdx) continue;
-                    c.aborted = true;
-                    for (Seg s : c.segs) if (s.conn != null) drop.add(s.conn);
-                    if (c.workers == 0) {
-                        if (c.buf != null) release.add(c.buf);
-                        c.buf = null;
-                        it.remove();
-                    }
-                }
-                next = Math.min(next, writeIdx + 1);
-                notifyAll();
-            }
-            for (HttpURLConnection h : drop) pool.execute(h::disconnect);
-            for (byte[] b : release) bp.give(b);
-        }
+        void supersede() { drop(false); }
 
         private void cancel() {
-            List<HttpURLConnection> drop = new ArrayList<>();
+            drop(true);
+            synchronized (t) { if (t.newest == this) t.newest = null; }
+        }
+
+        // Abort every piece past the player's position (all of them when cancelling). Buffers of pieces no worker
+        // holds are released here; a worker holding one releases it when it notices.
+        private void drop(boolean all) {
+            List<HttpURLConnection> conns = new ArrayList<>();
             List<byte[]> release = new ArrayList<>();
             synchronized (this) {
                 if (cancelled) return;
-                cancelled = true;
-                for (Iterator<Chunk> it = chunks.values().iterator(); it.hasNext(); ) {
-                    Chunk c = it.next();
-                    for (Seg s : c.segs) if (s.conn != null) drop.add(s.conn);
-                    if (c.workers == 0) {
+                if (all) cancelled = true; else superseded = true;
+                for (Iterator<Piece> it = pieces.values().iterator(); it.hasNext(); ) {
+                    Piece c = it.next();
+                    if (!all && c.index <= writeIdx) continue;
+                    c.aborted = true;
+                    if (c.conn != null) conns.add(c.conn);
+                    if (!c.reading) {
                         if (c.buf != null) release.add(c.buf);
                         c.buf = null;
                         it.remove();
                     }
                 }
+                for (Run run : runs) run.endIdx = Math.min(run.endIdx, Math.max(run.cur, writeIdx + 1));
+                next = Math.min(next, writeIdx + 1);
                 notifyAll();
             }
-            for (HttpURLConnection h : drop) pool.execute(h::disconnect);
+            for (HttpURLConnection h : conns) pool.execute(h::disconnect);
             for (byte[] b : release) bp.give(b);
-            synchronized (t) { if (t.newest == this) t.newest = null; }
+            bp.wake();
         }
 
         private void work(int id) {
             while (true) {
-                Chunk c = null;
-                Seg seg = null;
-                boolean fresh = false;
+                Run run = null;
                 synchronized (this) {
                     while (true) {
                         if (cancelled) return;
                         if (superseded && id > 0) return;
-                        if (next < count && next - writeIdx < ahead() && !chunks.containsKey(next)) {
-                            long b = start + (long) next * chunk;
-                            c = new Chunk(next, b, (int) Math.min(chunk, end + 1 - b));
-                            seg = new Seg(0, c.len);
-                            c.segs.add(seg);
-                            chunks.put(next, c);
-                            next++;
-                            fresh = true;
-                            break;
+                        if (streaming < (superseded ? 1 : conns)) {
+                            if (next < count && next - writeIdx < window()) {
+                                run = new Run(next, Math.min(count, next + (superseded ? 1 : runPieces)));
+                                for (int k = run.cur; k < run.endIdx; k++) {
+                                    long b = start + (long) k * piece;
+                                    pieces.put(k, new Piece(k, b, (int) Math.min(piece, end + 1 - b)));
+                                }
+                                next = run.endIdx;
+                                break;
+                            }
+                            if (!superseded && (run = split()) != null) break;
                         }
-                        if (!superseded && (seg = steal()) != null) { c = owner; break; }
-                        if (next >= count && chunks.isEmpty()) return;
+                        if (next >= count && runs.isEmpty()) return;
                         try { wait(250); } catch (InterruptedException e) { return; }
                     }
-                    seg.working = true;
-                    c.workers++;
+                    runs.add(run);
+                    streaming++;
                 }
-                if (fresh) {
-                    byte[] buf = null;
-                    try { buf = bp.take(this, c.index); } catch (InterruptedException ignored) { }
-                    synchronized (this) {
-                        if (buf == null || cancelled) {
-                            seg.working = false;
-                            c.workers--;
-                            if (c.workers == 0) chunks.remove(c.index);
-                            if (buf != null) bp.give(buf);
-                            notifyAll();
-                            return;
-                        }
-                        c.buf = buf;
-                        notifyAll();
-                    }
-                }
-                fetch(c, seg);
-                byte[] release = null;
+                stream(run);
                 synchronized (this) {
-                    seg.working = false;
-                    seg.conn = null;
-                    c.workers--;
-                    if ((cancelled || c.aborted) && c.workers == 0) {
-                        release = c.buf;
-                        c.buf = null;
-                        if (chunks.get(c.index) == c) chunks.remove(c.index);
-                    }
+                    runs.remove(run);
+                    if (run.streaming) streaming--;
                     notifyAll();
                 }
-                if (release != null) bp.give(release);
             }
         }
 
-        private Chunk owner; // set by steal(), read under the session lock
-
-        // Split the unfinished segment with the most bytes left (nearest the head first) and return the new half.
-        private Seg steal() {
-            Seg best = null;
-            Chunk bestChunk = null;
-            int bestLeft = MIN_SPLIT;
-            for (int k = writeIdx; k < next; k++) {
-                Chunk c = chunks.get(k);
-                if (c == null || c.buf == null || c.aborted || c.err != null) continue;
-                for (Seg s : c.segs) {
-                    int left = s.to - s.filled;
-                    if (s.working && left > bestLeft) { best = s; bestChunk = c; bestLeft = left; }
-                }
-                if (best != null) break; // prefer the chunk closest to the player
+        // Take over the unstarted second half of the run with the most unstarted pieces (nearest the player).
+        private Run split() {
+            Run best = null;
+            int bestLeft = 1;
+            for (Run run : runs) {
+                int left = run.endIdx - run.cur - 1; // pieces after the one being read
+                if (left > bestLeft || (left == bestLeft && best != null && run.cur < best.cur)) { best = run; bestLeft = left; }
             }
             if (best == null) return null;
-            // The owner may be mid-read of up to 256 KB past `filled`: split beyond that.
-            int split = best.filled + 256 * 1024 + (bestLeft - 256 * 1024) / 2;
-            Seg tail = new Seg(split, best.to);
-            best.to = split;
-            bestChunk.segs.add(bestChunk.segs.indexOf(best) + 1, tail);
-            owner = bestChunk;
+            int mid = best.endIdx - bestLeft / 2;
+            Run tail = new Run(mid, best.endIdx);
+            best.endIdx = mid;
             return tail;
         }
 
-        private void fetch(Chunk c, Seg seg) {
+        // Called under the lock: bytes this run still has to read.
+        private long remaining(Run run, Piece c) {
+            Piece last = pieces.get(run.endIdx - 1);
+            long runEnd = last != null ? last.begin + last.len : c.begin + c.len;
+            return runEnd - (c.begin + c.filled);
+        }
+
+        // One run: a single Range request read straight through its pieces; on errors, a new request from where
+        // it stopped.
+        private void stream(Run run) {
             int attempts = 0;
-            while (!cancelled && !c.aborted) {
-                int from, to;
-                synchronized (this) { from = seg.filled; to = seg.to; }
-                if (from >= to) return;
+            while (true) {
+                Piece c;
+                long from, to;
+                synchronized (this) {
+                    if (cancelled || run.cur >= run.endIdx) return;
+                    c = pieces.get(run.cur);
+                    if (c == null || c.aborted) return;
+                    Piece last = pieces.get(run.endIdx - 1);
+                    from = c.begin + c.filled;
+                    to = (last != null ? last.begin + last.len : c.begin + c.len) - 1;
+                }
                 long issued = System.currentTimeMillis();
                 HttpURLConnection conn = null;
                 try {
                     conn = open(t.url, t.headers, 4_000); // 4 s of silence = stalled connection: retry on a fresh one
-                    conn.setRequestProperty("Range", "bytes=" + (c.begin + from) + "-" + (c.begin + to - 1));
-                    synchronized (this) { seg.conn = conn; seg.progress = System.currentTimeMillis(); }
-                    if (cancelled || c.aborted) { conn.disconnect(); return; }
+                    conn.setRequestProperty("Range", "bytes=" + from + "-" + to);
                     int code = conn.getResponseCode();
                     if (code == 401 || code == 403 || code == 404 || code == 410) {
                         conn.disconnect();
@@ -625,40 +587,80 @@ final class Relay {
                     }
                     if (code != 206) throw new IOException("HTTP " + code + " for a range");
                     String cr = conn.getHeaderField("Content-Range");
-                    if (cr != null && !cr.startsWith("bytes " + (c.begin + from) + "-")) throw new IOException("range mismatch");
-                    boolean stopEarly = false;
+                    if (cr != null && !cr.startsWith("bytes " + from + "-")) throw new IOException("range mismatch");
+                    long pos = from;
+                    boolean more = true;
                     try (InputStream in = conn.getInputStream()) {
                         while (true) {
-                            int pos, n;
+                            // Next piece of the run (it may have been shortened by split() or a seek).
                             synchronized (this) {
-                                pos = seg.filled;
-                                n = Math.min(256 * 1024, seg.to - pos);
+                                if (cancelled || run.cur >= run.endIdx) { more = false; break; }
+                                c = pieces.get(run.cur);
+                                if (c == null || c.aborted) { more = false; break; }
+                                if (c.begin + c.filled != pos) throw new IOException("out of step");
+                                c.reading = true;
                             }
-                            if (n <= 0) break;
-                            int got = in.read(c.buf, pos, n);
-                            if (got < 0) throw new IOException("short read");
-                            synchronized (this) {
-                                seg.filled += got;
-                                seg.progress = System.currentTimeMillis();
-                                if (seg.filled >= seg.to && seg.to < to) stopEarly = true; // our tail was stolen
-                                notifyAll();
+                            if (c.buf == null) {
+                                byte[] buf = null;
+                                try { buf = bp.take(this, c.index); } catch (InterruptedException ignored) { }
+                                synchronized (this) {
+                                    if (buf != null && !c.aborted && !cancelled) { c.buf = buf; buf = null; }
+                                }
+                                if (buf != null) bp.give(buf);
+                                if (c.buf == null) { finish(c); more = false; break; }
                             }
+                            synchronized (this) { c.conn = conn; c.progress = System.currentTimeMillis(); }
+                            while (c.filled < c.len && !c.aborted && !cancelled) {
+                                int got = in.read(c.buf, c.filled, Math.min(256 * 1024, c.len - c.filled));
+                                if (got < 0) throw new IOException("short read");
+                                pos += got;
+                                synchronized (this) {
+                                    c.filled += got;
+                                    c.progress = System.currentTimeMillis();
+                                    if (run.streaming && remaining(run, c) <= TAIL) { run.streaming = false; streaming--; }
+                                    notifyAll();
+                                }
+                            }
+                            if (!finish(c)) { more = false; break; }
+                            synchronized (this) { run.cur++; attempts = 0; }
                         }
                     }
-                    if (stopEarly) conn.disconnect(); // unread rest of the response belongs to the other worker
-                    return;
+                    if (pos <= to) conn.disconnect(); // the unread rest of the response isn't ours any more
+                    if (!more) return;
                 } catch (IOException e) {
                     if (conn != null) conn.disconnect();
-                    if (cancelled || c.aborted) return;
+                    boolean stop;
+                    synchronized (this) { stop = cancelled || c == null || c.aborted; }
+                    if (c != null && c.reading && !finish(c)) stop = true;
+                    if (stop) return;
                     st.retries++;
                     if (++attempts >= 8) {
-                        Log.w(TAG, "chunk failed: " + Addons.safe(e.getMessage()));
+                        Log.w(TAG, "piece failed: " + Addons.safe(e.getMessage()));
                         synchronized (this) { c.err = e; notifyAll(); }
                         return;
                     }
                     try { Thread.sleep(100L * attempts); } catch (InterruptedException ie) { return; }
                 }
             }
+        }
+
+        // The worker lets go of a piece. Returns false if the piece was aborted meanwhile (its buffer is freed).
+        private boolean finish(Piece c) {
+            byte[] release = null;
+            boolean ok;
+            synchronized (this) {
+                c.reading = false;
+                c.conn = null;
+                ok = !c.aborted && !cancelled;
+                if (!ok) {
+                    release = c.buf;
+                    c.buf = null;
+                    if (pieces.get(c.index) == c) pieces.remove(c.index);
+                }
+                notifyAll();
+            }
+            if (release != null) bp.give(release);
+            return ok;
         }
     }
 }

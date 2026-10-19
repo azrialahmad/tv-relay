@@ -31,11 +31,11 @@ final class Store {
     int conns() { return p.getInt("conns", 4); }
     boolean testEnabled() { return p.getBoolean("test", false); }
     void setTestEnabled(boolean on) { p.edit().putBoolean("test", on).apply(); }
-    int chunkMb() { return p.getInt("chunkMb", 16); }
+    int runMb() { return p.getInt("runMb", 32); }
     int budgetMb() { return p.getInt("budgetMb", 96); }
 
-    void setTuning(int conns, int chunkMb, int budgetMb) {
-        p.edit().putInt("conns", clamp(conns, 1, 8)).putInt("chunkMb", clamp(chunkMb, 1, 16))
+    void setTuning(int conns, int runMb, int budgetMb) {
+        p.edit().putInt("conns", clamp(conns, 1, 8)).putInt("runMb", clamp(runMb, 4, 64))
                 .putInt("budgetMb", clamp(budgetMb, 16, 128)).apply();
     }
 

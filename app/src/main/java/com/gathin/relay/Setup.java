@@ -27,7 +27,7 @@ final class Setup {
                     msg = "Test streams " + (store.testEnabled() ? "on" : "off") + ".";
                 }
                 else if (r.path.equals("/setup/tune")) {
-                    store.setTuning(num(p.get("conns"), 4), num(p.get("chunk"), 16), num(p.get("budget"), 96));
+                    store.setTuning(num(p.get("conns"), 4), num(p.get("run"), 32), num(p.get("budget"), 96));
                     msg = "Saved. New streams use the new settings.";
                 }
             } catch (Exception e) {
@@ -97,7 +97,7 @@ final class Setup {
 
         s.append("<h2>Tuning</h2><form method=post action=/setup/tune>")
                 .append("<label>Parallel connections per stream (1-8)<input name=conns type=number value=").append(store.conns()).append("></label>")
-                .append("<label>Chunk size in MB (1-16)<input name=chunk type=number value=").append(store.chunkMb()).append("></label>")
+                .append("<label>Request size per connection in MB (4-64)<input name=run type=number value=").append(store.runMb()).append("></label>")
                 .append("<label>Memory budget in MB (16-128)<input name=budget type=number value=").append(store.budgetMb()).append("></label>")
                 .append("<button>Save</button></form>");
 
