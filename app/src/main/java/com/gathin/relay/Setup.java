@@ -22,6 +22,10 @@ final class Setup {
             try {
                 if (r.path.equals("/setup/add")) msg = add(p.get("url"), p.get("name"), p.get("id"));
                 else if (r.path.equals("/setup/del")) { store.remove(p.get("id")); msg = "Removed " + esc(p.get("id")) + "."; }
+                else if (r.path.equals("/setup/test")) {
+                    store.setTestEnabled(!store.testEnabled());
+                    msg = "Test streams " + (store.testEnabled() ? "on" : "off") + ".";
+                }
                 else if (r.path.equals("/setup/tune")) {
                     store.setTuning(num(p.get("conns"), 4), num(p.get("chunk"), 16), num(p.get("budget"), 96));
                     msg = "Saved. New streams use the new settings.";
@@ -72,7 +76,9 @@ final class Setup {
         s.append("<h2>Wrapped add-ons</h2><p><small>Stremio: use the 127.0.0.1 URL. Wuplay (config.wuplay.app): use the ")
                 .append(esc(lan)).append(" URL and tick \"hosted on my local network\".</small></p>")
                 .append("<table><tr><th>Add-on URLs</th><th>Upstream</th><th></th></tr>");
-        s.append("<tr><td>").append(urls(lan, "test")).append("</td><td>Built-in test (sample video)</td><td></td></tr>");
+        s.append("<tr><td>").append(urls(lan, "test")).append("</td><td>Built-in test (sample video), streams ")
+                .append(store.testEnabled() ? "on" : "off").append("</td><td><form method=post action=/setup/test><button>")
+                .append(store.testEnabled() ? "Turn off" : "Turn on").append("</button></form></td></tr>");
         for (Store.Upstream u : store.upstreams()) {
             String host;
             try { host = new URL(u.url).getHost(); } catch (Exception e) { host = "?"; }

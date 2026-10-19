@@ -27,7 +27,7 @@ measured at ~98 Mbps on wlan0 when the route was healthy.
 |---|---|
 | Stremio (any device, syncs) | `http://127.0.0.1:7000/a/duckstre/manifest.json` → shows as **Duck Streams (AIOStreams) ⚡** |
 | Wuplay (config.wuplay.app, tick "hosted on my local network") | `http://192.168.88.17:7000/a/duckstre/manifest.json` |
-| Test add-on (sample video, any title) | same, with `test` instead of `duckstre` |
+| Test add-on (sample video) | same, with `test` instead of `duckstre`. Its streams are **off** by default (it shows nothing); switch them on in /setup when testing. You can uninstall it from both apps. |
 
 Keep the original Duck Streams installed as a fallback. The ⚡ add-on only provides streams (no catalogs), with the same
 names, labels and order, so autoplay/next-episode (bingeGroup) behave the same. Debridio is already inside Duck

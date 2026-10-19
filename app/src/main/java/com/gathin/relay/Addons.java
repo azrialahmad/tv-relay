@@ -116,6 +116,9 @@ final class Addons {
                         .put("idPrefixes", new JSONArray().put("tt"))
                         .put("catalogs", new JSONArray());
                 r.send(200, "application/json; charset=utf-8", m.toString());
+            } else if (rest.startsWith("stream/") && !store.testEnabled()) {
+                // Off by default so the sample doesn't clutter every title; switch it on in /setup to test.
+                r.send(200, "application/json; charset=utf-8", "{\"streams\":[]}");
             } else if (rest.startsWith("stream/")) {
                 JSONObject s = new JSONObject().put("name", "Relay ⚡").put("title", "Relay test: Big Buck Bunny (sample)")
                         .put("url", TEST_VIDEO)

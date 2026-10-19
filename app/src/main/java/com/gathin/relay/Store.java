@@ -29,6 +29,8 @@ final class Store {
     Store(Context c) { p = c.getSharedPreferences("relay", Context.MODE_PRIVATE); }
 
     int conns() { return p.getInt("conns", 4); }
+    boolean testEnabled() { return p.getBoolean("test", false); }
+    void setTestEnabled(boolean on) { p.edit().putBoolean("test", on).apply(); }
     int chunkMb() { return p.getInt("chunkMb", 16); }
     int budgetMb() { return p.getInt("budgetMb", 96); }
 
