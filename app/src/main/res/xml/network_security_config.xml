@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<network-security-config>
+    <!-- Upstreams are https. Plain http is only for the relay itself on this TV (and plain-http CDNs). -->
+    <base-config cleartextTrafficPermitted="true" />
+</network-security-config>
