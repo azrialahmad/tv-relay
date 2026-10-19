@@ -7,7 +7,7 @@ import java.nio.file.Paths;
 // Runs on the TV via app_process. Reads the URL stored in <urlfile> (so keys never appear on a command line
 // or in output) over <threads> parallel connections, each starting at a different offset, for <seconds>.
 // Prints per-second Mbps and the average after a 2 s warm-up. Never prints the URL.
-// Usage: Bench <seconds> <threads> <urlfile> [startOffsetGB]
+// Usage: Bench <seconds> <threads> <urlfile> [startOffsetGB] [spacingMB, default 512]
 public class Bench {
     public static void main(String[] args) throws Exception {
         final int seconds = Integer.parseInt(args[0]);
@@ -26,7 +26,8 @@ public class Bench {
         final long end = System.currentTimeMillis() + seconds * 1000L;
         Thread[] ts = new Thread[threads];
         for (int t = 0; t < threads; t++) {
-            final long off = base + t * (512L << 20); // each connection reads its own region
+            final long spacing = (args.length > 4 ? Long.parseLong(args[4]) : 512L) << 20;
+            final long off = base + t * spacing; // each connection reads its own region
             ts[t] = new Thread(() -> {
                 try {
                     HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
