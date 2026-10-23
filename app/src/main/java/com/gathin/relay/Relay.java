@@ -357,7 +357,8 @@ final class Relay {
         final BufferPool bp;
         final Map<Integer, Piece> pieces = new HashMap<>();
         final List<Run> runs = new ArrayList<>();
-        int next, writeIdx, streaming;
+        int next, writeIdx, streaming, alive, workerCount;
+        private long lastResumeCheck;
         volatile boolean cancelled, superseded;
         final Stat st;
 
@@ -386,7 +387,10 @@ final class Relay {
             OutputStream out = r.out;
             // A couple of spare workers take over when a run nears its end.
             int workers = Math.min(conns + 2, count);
-            for (int i = 0; i < workers; i++) { final int id = i; pool.execute(() -> work(id)); }
+            synchronized (this) {
+                workerCount = workers;
+                for (int i = 0; i < workers; i++) spawn(i);
+            }
             try {
                 for (int k = 0; k < count; k++) {
                     Piece c;
@@ -411,6 +415,7 @@ final class Relay {
                         st.bytes += upto - written;
                         st.last = System.currentTimeMillis();
                         written = upto;
+                        maybeResume();
                         if (written >= c.len) break;
                     }
                     byte[] release;
@@ -469,6 +474,38 @@ final class Relay {
 
         // Another request for the same file arrived (a seek): stop reading ahead here and free the bandwidth.
         void supersede() { drop(false); }
+
+        // After a seek players often send a short extra request (an index lookup) that arrives after the real
+        // one, so the stream the player keeps reading gets superseded. Once the newer request has ended or gone
+        // quiet while this one is still being read, this is the real stream again: back to full speed.
+        private void maybeResume() {
+            if (!superseded) return;
+            long now = System.currentTimeMillis();
+            if (now - lastResumeCheck < 1000) return;
+            lastResumeCheck = now;
+            Session newer;
+            synchronized (t) {
+                newer = t.newest;
+                if (newer != null && newer != this && !newer.cancelled && now - newer.st.last < 3000) return;
+                t.newest = this;
+            }
+            if (newer != null && newer != this) newer.supersede(); // idle: free its read-ahead buffers
+            synchronized (this) {
+                if (cancelled) return;
+                superseded = false;
+                for (int i = alive; i < workerCount; i++) spawn(i);
+                notifyAll();
+            }
+            Log.i(TAG, "seek: resumed full speed on the stream being read");
+        }
+
+        // Called under the lock.
+        private void spawn(int id) {
+            alive++;
+            pool.execute(() -> {
+                try { work(id); } finally { synchronized (Session.this) { alive--; } }
+            });
+        }
 
         private void cancel() {
             drop(true);
